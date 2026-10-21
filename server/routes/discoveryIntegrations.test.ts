@@ -430,16 +430,13 @@ describe('personal discovery account boundaries', () => {
     assert.equal(result.status, 404);
     assert.equal(result.body.code, 'PROVIDER_LIST_NOT_FOUND');
   });
-  it('does not accept a browser-supplied Trakt device code', async () => {
+  it('rejects a Trakt callback with a mismatched state', async () => {
     const agent = await login();
-    const poll = mock.method(TraktAPI.prototype, 'pollForToken', async () => ({
-      status: 'pending' as const,
-    }));
-    const result = await agent
-      .post('/integrations/discovery/accounts/trakt/complete')
-      .send({ deviceCode: 'attacker-code' });
-    assert.equal(result.status, 409);
-    assert.equal(poll.mock.callCount(), 0);
+    const result = await agent.get(
+      '/integrations/discovery/trakt/callback?code=auth-code&state=bogus'
+    );
+    assert.equal(result.status, 302);
+    assert.ok(result.headers.location.includes('traktError=expired'));
   });
   it('rejects missing AniList PINs before contacting the provider', async () => {
     const agent = await login();
@@ -459,39 +456,28 @@ describe('personal discovery account boundaries', () => {
   });
 });
 
-it('retains device credentials server-side, resumes an attempt, and stores authorized tokens correctly', async () => {
+it('exchanges a Trakt authorization code via PKCE and stores tokens server-side', async () => {
   const agent = await login();
   Object.assign(getSettings().discoveryIntegrations.trakt, {
     clientId: 'test-app',
-    clientSecret: 'app-secret',
   });
-  const start = mock.method(
+  const exchange = mock.method(
     TraktAPI.prototype,
-    'requestDeviceCode',
-    async () => ({
-      device_code: 'private-device',
-      user_code: 'PUBLIC-CODE',
-      verification_url: 'https://trakt.tv/activate',
-      expires_in: 600,
-      interval: 5,
-    })
-  );
-  const poll = mock.method(
-    TraktAPI.prototype,
-    'pollForToken',
-    async (code: string) => {
-      assert.equal(code, 'private-device');
+    'exchangeCodeForTokens',
+    async (code: string, verifier: string, redirectUri: string) => {
+      assert.equal(code, 'auth-code');
+      assert.ok(verifier.length >= 43);
+      assert.ok(
+        redirectUri.endsWith('/api/v1/integrations/discovery/trakt/callback')
+      );
       return {
-        status: 'authorized' as const,
-        tokens: {
-          access_token: 'linked-access',
-          refresh_token: 'linked-refresh',
-          token_type: 'bearer',
-          expires_in: 3600,
-          created_at: Math.floor(Date.now() / 1000),
-          scope: 'public',
-          expiresAt: Math.floor(Date.now() / 1000) + 3600,
-        },
+        access_token: 'linked-access',
+        refresh_token: 'linked-refresh',
+        token_type: 'bearer',
+        expires_in: 3600,
+        created_at: Math.floor(Date.now() / 1000),
+        scope: 'public',
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
       };
     }
   );
@@ -503,31 +489,30 @@ it('retains device credentials server-side, resumes an attempt, and stores autho
     '/integrations/discovery/accounts/trakt/connect'
   );
   assert.equal(begin.status, 200);
-  assert.equal(begin.body.userCode, 'PUBLIC-CODE');
-  assert.equal(JSON.stringify(begin.body).includes('private-device'), false);
-  assert.equal(
-    (await agent.post('/integrations/discovery/accounts/trakt/connect')).status,
-    200
+  assert.equal(typeof begin.body.authorizeUrl, 'string');
+  assert.ok(
+    begin.body.authorizeUrl.startsWith('https://trakt.tv/oauth/authorize')
   );
-  assert.equal(start.mock.callCount(), 1);
+  assert.ok(begin.body.authorizeUrl.includes('code_challenge_method=S256'));
+  assert.equal(JSON.stringify(begin.body).includes('code_verifier'), false);
+  assert.equal(exchange.mock.callCount(), 0);
+  // The legacy polling endpoint no longer authorizes Trakt.
   assert.equal(
     (
-      await agent
-        .post('/integrations/discovery/accounts/trakt/complete')
-        .send({})
+      await agent.post('/integrations/discovery/accounts/trakt/complete').send({})
     ).status,
-    202
+    409
   );
-  assert.equal(poll.mock.callCount(), 0);
-  const now = Date.now();
-  mock.method(Date, 'now', () => now + 6000);
-  const completed = await agent
-    .post('/integrations/discovery/accounts/trakt/complete')
-    .send({});
-  assert.equal(completed.status, 200);
-  assert.equal(completed.body.status, 'authorized');
-  assert.equal(completed.body.account.username, 'connected-viewer');
-  assert.equal(JSON.stringify(completed.body).includes('linked-access'), false);
+  const state = new URL(begin.body.authorizeUrl).searchParams.get('state');
+  assert.ok(state);
+  const done = await agent.get(
+    `/integrations/discovery/trakt/callback?code=auth-code&state=${encodeURIComponent(
+      state!
+    )}`
+  );
+  assert.equal(done.status, 302);
+  assert.ok(done.headers.location.includes('traktConnected=1'));
+  assert.equal(exchange.mock.callCount(), 1);
   const account = await getRepository(DiscoveryAccount)
     .createQueryBuilder('account')
     .addSelect(['account.accessToken', 'account.refreshToken'])

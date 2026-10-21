@@ -1,7 +1,10 @@
 import AnilistAPI from '@server/api/anilist';
 import SimklAPI from '@server/api/simkl';
 import TheMovieDb from '@server/api/themoviedb';
-import TraktAPI from '@server/api/trakt';
+import TraktAPI, {
+  derivePkceChallenge,
+  generatePkceVerifier,
+} from '@server/api/trakt';
 import { getRepository } from '@server/datasource';
 import DiscoveryAccount from '@server/entity/DiscoveryAccount';
 import ProviderTrackingAction from '@server/entity/ProviderTrackingAction';
@@ -68,6 +71,22 @@ import {
 } from '@server/middleware/authorizedMutation';
 import express, { Router } from 'express';
 import rateLimit from 'express-rate-limit';
+import { randomBytes } from 'node:crypto';
+
+const TRAKT_CALLBACK_PATH =
+  '/api/v1/integrations/discovery/trakt/callback';
+
+const traktRedirectUri = (req: express.Request): string => {
+  const forwardedProto = (
+    req.headers['x-forwarded-proto'] as string | undefined
+  )?.split(',')[0]?.trim();
+  const forwardedHost = (
+    req.headers['x-forwarded-host'] as string | undefined
+  )?.split(',')[0]?.trim();
+  const proto = forwardedProto || req.protocol || 'http';
+  const host = forwardedHost || req.headers.host;
+  return `${proto}://${host}${TRAKT_CALLBACK_PATH}`;
+};
 
 const router = Router();
 router.use((_req, res, next) => {
@@ -307,7 +326,7 @@ function publicConfiguration() {
   return {
     trakt: {
       clientId: config.trakt.clientId,
-      configured: !!(config.trakt.clientId && config.trakt.clientSecret),
+      configured: !!config.trakt.clientId,
     },
     anilist: {
       clientId: config.anilist.clientId,
@@ -333,7 +352,7 @@ router.put(
           'Invalid integration settings.'
         );
       const allowed = {
-        trakt: ['clientId', 'clientSecret'],
+        trakt: ['clientId'],
         anilist: ['clientId', 'clientSecret'],
         simkl: ['clientId'],
         mdblist: ['apiKey'],
@@ -432,10 +451,7 @@ router.post(
     await personalMutation(req, () =>
       runWithConfigurationAdmission('discoveryIntegrations', async () => {
         const config = getSettings().discoveryIntegrations[provider];
-        if (
-          !config.clientId ||
-          ('clientSecret' in config && !config.clientSecret)
-        )
+        if (!config.clientId)
           throw new DiscoveryIntegrationError(
             409,
             'Ask your administrator to configure this integration first.'
@@ -444,7 +460,25 @@ router.post(
           return res.json({
             verificationUrl: AnilistAPI.buildAuthorizeUrl(config.clientId),
           });
-        const pending = req.session.discoveryAuth?.[provider];
+        if (provider === 'trakt') {
+          const codeVerifier = generatePkceVerifier();
+          const codeChallenge = derivePkceChallenge(codeVerifier);
+          const state = randomBytes(16).toString('hex');
+          req.session.discoveryAuth ??= {};
+          req.session.discoveryAuth.trakt = {
+            codeVerifier,
+            state,
+            clientId: config.clientId,
+            expiresAt: Date.now() + 10 * 60 * 1000,
+          };
+          const authorizeUrl = new TraktAPI(config).buildAuthorizeUrl(
+            traktRedirectUri(req),
+            codeChallenge,
+            state
+          );
+          return res.json({ authorizeUrl });
+        }
+        const pending = req.session.discoveryAuth?.simkl;
         if (
           pending &&
           pending.expiresAt > Date.now() &&
@@ -452,25 +486,16 @@ router.post(
         ) {
           return res.json({
             userCode: pending.userCode,
-            verificationUrl:
-              provider === 'trakt'
-                ? 'https://trakt.tv/activate'
-                : 'https://simkl.com/pin/',
+            verificationUrl: 'https://simkl.com/pin/',
             interval: pending.interval,
             expiresIn: Math.ceil((pending.expiresAt - Date.now()) / 1000),
           });
         }
-        const result =
-          provider === 'trakt'
-            ? await new TraktAPI(
-                getSettings().discoveryIntegrations.trakt
-              ).requestDeviceCode()
-            : await new SimklAPI({
-                clientId: config.clientId,
-              }).requestPinCode();
-        const code = 'device_code' in result ? result.device_code : undefined;
+        const result = await new SimklAPI({
+          clientId: config.clientId,
+        }).requestPinCode();
         const userCode = result.user_code;
-        if (!userCode || (provider === 'trakt' && !code))
+        if (!userCode)
           throw new DiscoveryIntegrationError(
             502,
             'Provider returned an invalid connection code.'
@@ -481,8 +506,7 @@ router.post(
           Math.min(1800, result.expires_in ?? 600)
         );
         req.session.discoveryAuth ??= {};
-        req.session.discoveryAuth[provider] = {
-          code: code ?? userCode,
+        req.session.discoveryAuth.simkl = {
           userCode,
           clientId: config.clientId,
           interval,
@@ -491,10 +515,7 @@ router.post(
         };
         res.json({
           userCode,
-          verificationUrl:
-            provider === 'trakt'
-              ? 'https://trakt.tv/activate'
-              : 'https://simkl.com/pin/',
+          verificationUrl: 'https://simkl.com/pin/',
           interval,
           expiresIn,
         });
@@ -542,6 +563,11 @@ router.post(
             account: publicDiscoveryAccount(account),
           });
         }
+        if (provider === 'trakt')
+          throw new DiscoveryIntegrationError(
+            409,
+            'Trakt uses the OAuth redirect flow. Complete authorization in your browser.'
+          );
         const pending = req.session.discoveryAuth?.[provider];
         if (
           !pending ||
@@ -560,44 +586,6 @@ router.post(
             .status(202)
             .json({ status: 'pending', interval: pending.interval });
         pending.nextPollAt = Date.now() + pending.interval * 1000;
-        if (provider === 'trakt') {
-          const result = await new TraktAPI(
-            getSettings().discoveryIntegrations.trakt
-          ).pollForToken(pending.code);
-          if (result.status !== 'authorized') {
-            if (result.status === 'slow_down')
-              pending.interval = Math.min(60, pending.interval + 5);
-            if (result.status !== 'pending' && result.status !== 'slow_down')
-              delete req.session.discoveryAuth![provider];
-            return res
-              .status(202)
-              .json({ status: result.status, interval: pending.interval });
-          }
-          const identity = await new TraktAPI({
-            ...getSettings().discoveryIntegrations.trakt,
-            accessToken: result.tokens.access_token,
-            refreshToken: result.tokens.refresh_token,
-            expiresAt: result.tokens.expiresAt,
-          }).getUserSettings();
-          const account = await saveDiscoveryAccount(
-            req.user!.id,
-            provider,
-            {
-              accessToken: result.tokens.access_token,
-              refreshToken: result.tokens.refresh_token,
-              expiresAt: result.tokens.expiresAt,
-            },
-            {
-              username: identity.username,
-              providerUserId: String(identity.traktUserId),
-            }
-          );
-          delete req.session.discoveryAuth![provider];
-          return res.json({
-            status: 'authorized',
-            account: publicDiscoveryAccount(account),
-          });
-        }
         const result = await new SimklAPI({
           clientId: config.clientId,
         }).pollPinToken(pending.userCode);
@@ -630,6 +618,58 @@ router.post(
     );
   })
 );
+router.get('/trakt/callback', async (req: express.Request, res: express.Response) => {
+  const code =
+    typeof req.query.code === 'string' ? req.query.code.trim() : '';
+  const state = typeof req.query.state === 'string' ? req.query.state : '';
+  const frontendError = (reason: string) =>
+    res.redirect(
+      `/settings/discovery?traktError=${encodeURIComponent(reason)}`
+    );
+  const pending = req.session.discoveryAuth?.trakt;
+  if (
+    !code ||
+    !pending ||
+    pending.state !== state ||
+    pending.expiresAt <= Date.now()
+  ) {
+    if (req.session.discoveryAuth) delete req.session.discoveryAuth.trakt;
+    return frontendError('expired');
+  }
+  try {
+    const config = getSettings().discoveryIntegrations.trakt;
+    const tokens = await new TraktAPI(config).exchangeCodeForTokens(
+      code,
+      pending.codeVerifier,
+      traktRedirectUri(req)
+    );
+    const identity = await new TraktAPI({
+      ...config,
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token,
+      expiresAt: tokens.expiresAt,
+    }).getUserSettings();
+    await personalMutation(req, () =>
+      saveDiscoveryAccount(
+        req.user!.id,
+        'trakt',
+        {
+          accessToken: tokens.access_token,
+          refreshToken: tokens.refresh_token,
+          expiresAt: tokens.expiresAt,
+        },
+        {
+          username: identity.username,
+          providerUserId: String(identity.traktUserId),
+        }
+      )
+    );
+    delete req.session.discoveryAuth!.trakt;
+    return res.redirect('/settings/discovery?traktConnected=1');
+  } catch {
+    return frontendError('exchange');
+  }
+});
 router.get(
   '/feeds/:provider/:feed',
   handle(async (req, res) => {

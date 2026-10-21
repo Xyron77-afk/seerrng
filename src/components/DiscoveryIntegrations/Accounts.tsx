@@ -187,6 +187,10 @@ export default function DiscoveryAccounts() {
                       const response = await axios.post(
                         `${base}/accounts/${provider}/connect`
                       );
+                      if (provider === 'trakt' && response.data.authorizeUrl) {
+                        window.location.href = response.data.authorizeUrl;
+                        return;
+                      }
                       setPending({
                         provider,
                         ...response.data,
