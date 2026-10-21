@@ -15,6 +15,9 @@ declare module 'express-session' {
         codeVerifier: string;
         state: string;
         clientId: string;
+        userId: number;
+        applicationUrl: string;
+        redirectUri: string;
         expiresAt: number;
       };
       simkl?: {

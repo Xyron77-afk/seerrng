@@ -71,21 +71,140 @@ import {
 } from '@server/middleware/authorizedMutation';
 import express, { Router } from 'express';
 import rateLimit from 'express-rate-limit';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 
-const TRAKT_CALLBACK_PATH =
-  '/api/v1/integrations/discovery/trakt/callback';
+const TRAKT_CALLBACK_PATH = '/api/v1/integrations/discovery/trakt/callback';
+const TRAKT_CALLBACK_COOKIE_PREFIX = 'trakt-discovery-oauth-callback-';
+const TRAKT_AUTHORIZATION_TTL_MS = 10 * 60 * 1000;
+const MAX_ACTIVE_TRAKT_CALLBACK_COOKIES = 8;
+const traktCallbackRateLimit = rateLimit({
+  windowMs: 60_000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: () =>
+    process.env.NODE_ENV === 'test' || process.env.E2E_TESTS === 'true',
+});
 
-const traktRedirectUri = (req: express.Request): string => {
-  const forwardedProto = (
-    req.headers['x-forwarded-proto'] as string | undefined
-  )?.split(',')[0]?.trim();
-  const forwardedHost = (
-    req.headers['x-forwarded-host'] as string | undefined
-  )?.split(',')[0]?.trim();
-  const proto = forwardedProto || req.protocol || 'http';
-  const host = forwardedHost || req.headers.host;
-  return `${proto}://${host}${TRAKT_CALLBACK_PATH}`;
+const traktRedirectContext = (): {
+  applicationUrl: string;
+  redirectUri: string;
+  callbackCookiePath: string;
+} | null => {
+  const configuredUrl = getSettings().main.applicationUrl?.trim();
+  if (!configuredUrl) return null;
+  try {
+    const url = new URL(configuredUrl);
+    if (
+      url.protocol !== 'https:' ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    ) {
+      return null;
+    }
+    const applicationUrl = `${url.origin}${url.pathname.replace(/\/+$/u, '')}`;
+    return {
+      applicationUrl,
+      redirectUri: `${applicationUrl}${TRAKT_CALLBACK_PATH}`,
+      callbackCookiePath: `${url.pathname.replace(/\/+$/u, '')}/api/v1/integrations/discovery`,
+    };
+  } catch {
+    return null;
+  }
+};
+
+const traktSettingsUrl = (
+  applicationUrl: string,
+  result: {
+    traktComplete?: boolean;
+    traktConnected?: boolean;
+    traktError?: string;
+  }
+): string => {
+  const appUrl = new URL(applicationUrl);
+  const basePath = appUrl.pathname.replace(/\/+$/u, '');
+  const destination = new URL(`${basePath}/settings/discovery`, appUrl.origin);
+  if (result.traktComplete) destination.searchParams.set('traktComplete', '1');
+  if (result.traktConnected)
+    destination.searchParams.set('traktConnected', '1');
+  if (result.traktError)
+    destination.searchParams.set('traktError', result.traktError);
+  return destination.toString();
+};
+
+const traktCallbackCookiePath = (applicationUrl: string): string => {
+  const url = new URL(applicationUrl);
+  return `${url.pathname.replace(/\/+$/u, '')}/api/v1/integrations/discovery`;
+};
+
+const getTraktCallbackCookieName = (state: string): string | undefined =>
+  /^[a-f0-9]{64}$/u.test(state)
+    ? `${TRAKT_CALLBACK_COOKIE_PREFIX}${state}`
+    : undefined;
+
+const clearTraktCallbackCookie = (
+  res: express.Response,
+  name: string,
+  path: string
+): void => {
+  res.clearCookie(name, { path, sameSite: 'lax', secure: true });
+};
+
+const pruneTraktCallbackCookies = (
+  req: express.Request,
+  res: express.Response,
+  path: string
+): void => {
+  const cookies = Object.entries(req.signedCookies as Record<string, unknown>)
+    .filter(([name]) => name.startsWith(TRAKT_CALLBACK_COOKIE_PREFIX))
+    .map(([name, value]) => ({
+      name,
+      expiresAt: parseTraktCallbackData(value)?.expiresAt ?? 0,
+    }))
+    .sort((left, right) => right.expiresAt - left.expiresAt);
+  for (const { name } of cookies.slice(MAX_ACTIVE_TRAKT_CALLBACK_COOKIES - 1))
+    clearTraktCallbackCookie(res, name, path);
+};
+
+const stateMatches = (provided: string, expected: string): boolean => {
+  const providedBytes = Buffer.from(provided);
+  const expectedBytes = Buffer.from(expected);
+  return (
+    providedBytes.length > 0 &&
+    providedBytes.length === expectedBytes.length &&
+    timingSafeEqual(providedBytes, expectedBytes)
+  );
+};
+
+interface TraktCallbackData {
+  code: string;
+  state: string;
+  expiresAt: number;
+}
+
+const parseTraktCallbackData = (
+  value: unknown
+): TraktCallbackData | undefined => {
+  if (typeof value !== 'string') return undefined;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      typeof (parsed as Partial<TraktCallbackData>).code === 'string' &&
+      (parsed as Partial<TraktCallbackData>).code!.length <= 4096 &&
+      typeof (parsed as Partial<TraktCallbackData>).state === 'string' &&
+      /^[a-f0-9]{64}$/u.test((parsed as Partial<TraktCallbackData>).state!) &&
+      Number.isSafeInteger((parsed as Partial<TraktCallbackData>).expiresAt)
+    ) {
+      return parsed as TraktCallbackData;
+    }
+  } catch {
+    // Invalid signed callback cookies are handled as expired authorizations.
+  }
+  return undefined;
 };
 
 const router = Router();
@@ -93,6 +212,70 @@ router.use((_req, res, next) => {
   res.set('Cache-Control', 'private, no-store');
   next();
 });
+
+// The provider returns here through a cross-site navigation. Keep this
+// callback outside the authenticated router so it can hand off the one-time
+// code through a short-lived, signed, HttpOnly cookie, then finish the link
+// from the same-site settings page where the normal session and CSRF checks
+// apply.
+router.get('/trakt/callback', traktCallbackRateLimit, (req, res) => {
+  const code =
+    typeof req.query.code === 'string' && req.query.code.length <= 4096
+      ? req.query.code.trim()
+      : '';
+  const state =
+    typeof req.query.state === 'string' && req.query.state.length <= 128
+      ? req.query.state
+      : '';
+  const providerError =
+    typeof req.query.error === 'string' && req.query.error.length <= 128;
+  const redirectContext = traktRedirectContext();
+  res.set('Referrer-Policy', 'no-referrer');
+  if (!redirectContext)
+    return res
+      .status(400)
+      .send('Trakt authorization could not be completed. Return to SeerrNG.');
+  const cookieName = getTraktCallbackCookieName(state);
+  if (providerError || !code || !cookieName) {
+    if (cookieName)
+      clearTraktCallbackCookie(
+        res,
+        cookieName,
+        redirectContext.callbackCookiePath
+      );
+    return res.redirect(
+      303,
+      traktSettingsUrl(redirectContext.applicationUrl, {
+        traktError: providerError ? 'denied' : 'expired',
+      })
+    );
+  }
+
+  pruneTraktCallbackCookies(req, res, redirectContext.callbackCookiePath);
+
+  res.cookie(
+    cookieName,
+    JSON.stringify({
+      code,
+      state,
+      expiresAt: Date.now() + TRAKT_AUTHORIZATION_TTL_MS,
+    } satisfies TraktCallbackData),
+    {
+      httpOnly: true,
+      maxAge: TRAKT_AUTHORIZATION_TTL_MS,
+      path: redirectContext.callbackCookiePath,
+      sameSite: 'lax',
+      secure: true,
+      signed: true,
+    }
+  );
+  return res.redirect(
+    303,
+    traktSettingsUrl(redirectContext.applicationUrl, { traktComplete: true })
+  );
+});
+
+router.use(isAuthenticated());
 const handle = handleDiscoveryIntegration;
 const personalMutation = runPersonalDiscoveryMutation;
 const identityMappingRateLimit = rateLimit({
@@ -461,18 +644,37 @@ router.post(
             verificationUrl: AnilistAPI.buildAuthorizeUrl(config.clientId),
           });
         if (provider === 'trakt') {
+          const redirectContext = traktRedirectContext();
+          if (!redirectContext)
+            throw new DiscoveryIntegrationError(
+              409,
+              'Set a public HTTPS application URL in Settings → General before connecting Trakt.'
+            );
           const codeVerifier = generatePkceVerifier();
           const codeChallenge = derivePkceChallenge(codeVerifier);
-          const state = randomBytes(16).toString('hex');
+          const state = randomBytes(32).toString('hex');
+          const previousState = req.session.discoveryAuth?.trakt?.state;
+          const previousCookieName = previousState
+            ? getTraktCallbackCookieName(previousState)
+            : undefined;
+          if (previousCookieName)
+            clearTraktCallbackCookie(
+              res,
+              previousCookieName,
+              redirectContext.callbackCookiePath
+            );
           req.session.discoveryAuth ??= {};
           req.session.discoveryAuth.trakt = {
             codeVerifier,
             state,
             clientId: config.clientId,
-            expiresAt: Date.now() + 10 * 60 * 1000,
+            userId: req.user!.id,
+            applicationUrl: redirectContext.applicationUrl,
+            redirectUri: redirectContext.redirectUri,
+            expiresAt: Date.now() + TRAKT_AUTHORIZATION_TTL_MS,
           };
           const authorizeUrl = new TraktAPI(config).buildAuthorizeUrl(
-            traktRedirectUri(req),
+            redirectContext.redirectUri,
             codeChallenge,
             state
           );
@@ -563,11 +765,85 @@ router.post(
             account: publicDiscoveryAccount(account),
           });
         }
-        if (provider === 'trakt')
-          throw new DiscoveryIntegrationError(
-            409,
-            'Trakt uses the OAuth redirect flow. Complete authorization in your browser.'
+        if (provider === 'trakt') {
+          const pending = req.session.discoveryAuth?.trakt;
+          const currentRedirectContext = traktRedirectContext();
+          const callbackCookieName = pending
+            ? getTraktCallbackCookieName(pending.state)
+            : undefined;
+          const callbackData = callbackCookieName
+            ? parseTraktCallbackData(req.signedCookies?.[callbackCookieName])
+            : undefined;
+          const cookiePaths = new Set(
+            [
+              currentRedirectContext?.callbackCookiePath,
+              pending
+                ? traktCallbackCookiePath(pending.applicationUrl)
+                : undefined,
+            ].filter((path): path is string => Boolean(path))
           );
+          if (callbackCookieName) {
+            for (const cookiePath of cookiePaths)
+              clearTraktCallbackCookie(res, callbackCookieName, cookiePath);
+          }
+          if (
+            !pending ||
+            !callbackData ||
+            callbackData.expiresAt <= Date.now() ||
+            pending.expiresAt <= Date.now() ||
+            !stateMatches(callbackData.state, pending.state) ||
+            pending.userId !== req.user!.id ||
+            pending.clientId !== config.clientId ||
+            pending.applicationUrl !== currentRedirectContext?.applicationUrl ||
+            pending.redirectUri !== currentRedirectContext?.redirectUri
+          ) {
+            if (req.session.discoveryAuth)
+              delete req.session.discoveryAuth.trakt;
+            if (cookiePaths.size > 0) {
+              for (const name of Object.keys(
+                req.signedCookies as Record<string, unknown>
+              ).filter((value) =>
+                value.startsWith(TRAKT_CALLBACK_COOKIE_PREFIX)
+              )) {
+                for (const cookiePath of cookiePaths)
+                  clearTraktCallbackCookie(res, name, cookiePath);
+              }
+            }
+            throw new DiscoveryIntegrationError(
+              409,
+              'Connection expired. Start again.'
+            );
+          }
+          delete req.session.discoveryAuth!.trakt;
+          const tokens = await new TraktAPI(config).exchangeCodeForTokens(
+            callbackData.code,
+            pending.codeVerifier,
+            pending.redirectUri
+          );
+          const identity = await new TraktAPI({
+            ...config,
+            accessToken: tokens.access_token,
+            refreshToken: tokens.refresh_token,
+            expiresAt: tokens.expiresAt,
+          }).getUserSettings();
+          const account = await saveDiscoveryAccount(
+            req.user!.id,
+            'trakt',
+            {
+              accessToken: tokens.access_token,
+              refreshToken: tokens.refresh_token,
+              expiresAt: tokens.expiresAt,
+            },
+            {
+              username: identity.username,
+              providerUserId: String(identity.traktUserId),
+            }
+          );
+          return res.json({
+            status: 'authorized',
+            account: publicDiscoveryAccount(account),
+          });
+        }
         const pending = req.session.discoveryAuth?.[provider];
         if (
           !pending ||
@@ -618,58 +894,6 @@ router.post(
     );
   })
 );
-router.get('/trakt/callback', async (req: express.Request, res: express.Response) => {
-  const code =
-    typeof req.query.code === 'string' ? req.query.code.trim() : '';
-  const state = typeof req.query.state === 'string' ? req.query.state : '';
-  const frontendError = (reason: string) =>
-    res.redirect(
-      `/settings/discovery?traktError=${encodeURIComponent(reason)}`
-    );
-  const pending = req.session.discoveryAuth?.trakt;
-  if (
-    !code ||
-    !pending ||
-    pending.state !== state ||
-    pending.expiresAt <= Date.now()
-  ) {
-    if (req.session.discoveryAuth) delete req.session.discoveryAuth.trakt;
-    return frontendError('expired');
-  }
-  try {
-    const config = getSettings().discoveryIntegrations.trakt;
-    const tokens = await new TraktAPI(config).exchangeCodeForTokens(
-      code,
-      pending.codeVerifier,
-      traktRedirectUri(req)
-    );
-    const identity = await new TraktAPI({
-      ...config,
-      accessToken: tokens.access_token,
-      refreshToken: tokens.refresh_token,
-      expiresAt: tokens.expiresAt,
-    }).getUserSettings();
-    await personalMutation(req, () =>
-      saveDiscoveryAccount(
-        req.user!.id,
-        'trakt',
-        {
-          accessToken: tokens.access_token,
-          refreshToken: tokens.refresh_token,
-          expiresAt: tokens.expiresAt,
-        },
-        {
-          username: identity.username,
-          providerUserId: String(identity.traktUserId),
-        }
-      )
-    );
-    delete req.session.discoveryAuth!.trakt;
-    return res.redirect('/settings/discovery?traktConnected=1');
-  } catch {
-    return frontendError('exchange');
-  }
-});
 router.get(
   '/feeds/:provider/:feed',
   handle(async (req, res) => {

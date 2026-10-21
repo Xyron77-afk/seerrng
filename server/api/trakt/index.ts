@@ -29,7 +29,7 @@ import axios, { type AxiosInstance } from 'axios';
 import { createHash, randomBytes } from 'node:crypto';
 
 const TRAKT_BASE_URL = 'https://api.trakt.tv';
-const TRAKT_AUTHORIZE_URL = 'https://trakt.tv/oauth/authorize';
+const TRAKT_AUTHORIZE_URL = 'https://auth.trakt.tv/oauth/authorize';
 
 /** Generate a PKCE code verifier: 43 chars of base64url, within 43–128. */
 export const generatePkceVerifier = (): string =>
@@ -198,7 +198,6 @@ const openTraktCircuit = (
 
 interface TraktAPIOptions {
   clientId: string;
-  clientSecret?: string;
   accessToken?: string;
   refreshToken?: string;
   expiresAt?: number;
@@ -378,7 +377,9 @@ class TraktAPI extends ExternalAPI {
     );
 
     if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Trakt token exchange failed (status ${response.status})`);
+      throw new Error(
+        `Trakt token exchange failed (status ${response.status})`
+      );
     }
 
     return this.applyTokens(response.data);
