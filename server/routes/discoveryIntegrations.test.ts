@@ -18,19 +18,21 @@ import cookieParser from 'cookie-parser';
 import express from 'express';
 import session from 'express-session';
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import { afterEach, before, describe, it, mock } from 'node:test';
 import request from 'supertest';
 import authRoutes from './auth';
 import discoveryRoutes from './discoveryIntegrations';
 
 const app = express();
+const testSessionSecret = randomBytes(32).toString('base64url');
 app.use(express.json());
-app.use(cookieParser('discovery-tests'));
+app.use(cookieParser(testSessionSecret));
 app.use(
   // This Supertest-only session never listens on a network socket.
   // codeql[js/clear-text-cookie]
   session({
-    secret: 'discovery-tests',
+    secret: testSessionSecret,
     resave: false,
     saveUninitialized: false,
   })
