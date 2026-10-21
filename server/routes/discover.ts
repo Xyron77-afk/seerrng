@@ -4452,7 +4452,7 @@ discoverRoutes.get('/comics', async (req, res) => {
       .status(400)
       .json({ status: 400, message: parsedSearchQuery.error });
   }
-  const query = parsedSearchQuery.value || '*';
+  const query = parsedSearchQuery.value?.trim() ?? '';
   const parsedPublisher = parseOptionalDiscoverString(
     req.query.publisher,
     'Publisher',
@@ -4562,6 +4562,15 @@ discoverRoutes.get('/comics', async (req, res) => {
         comicVineConfigured: true,
         indexing: false,
         lastIndexedAt: scan.lastCompletedAt,
+      });
+    }
+    if (!query) {
+      return res.status(200).json({
+        page,
+        totalPages: 0,
+        totalResults: 0,
+        results: [],
+        comicVineConfigured: true,
       });
     }
     const comicVine = new ComicVineAPI(comicVineApiKey);
