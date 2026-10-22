@@ -83,7 +83,20 @@ describe('Discovery provider integrations', () => {
     cy.contains('button', 'Mark episode watched').should('be.visible');
   });
   it('shows application credentials without exposing saved secrets', () => {
+    let traktClientId = 'application-id';
+    const configuration = () => ({
+      trakt: { clientId: traktClientId, configured: true },
+      anilist: { clientId: 'anilist-id', configured: true },
+      simkl: { clientId: 'simkl-id', configured: false },
+      mdblist: { configured: true },
+    });
+    cy.intercept(
+      'GET',
+      '/api/v1/integrations/discovery/configuration',
+      (request) => request.reply(configuration())
+    ).as('loadIntegrationSettings');
     cy.visit('/settings/discovery');
+    cy.wait('@loadIntegrationSettings');
     cy.get('#trakt-clientId').should('have.value', 'application-id');
     // Trakt authenticates via PKCE and no longer stores a client secret.
     cy.get('#trakt-clientSecret').should('not.exist');
@@ -97,12 +110,8 @@ describe('Discovery provider integrations', () => {
         expect(request.body).to.deep.equal({
           trakt: { clientId: 'updated-id' },
         });
-        request.reply({
-          trakt: { clientId: 'updated-id', configured: true },
-          anilist: { clientId: 'anilist-id', configured: true },
-          simkl: { clientId: 'simkl-id', configured: false },
-          mdblist: { configured: true },
-        });
+        traktClientId = request.body.trakt.clientId;
+        request.reply(configuration());
       }
     ).as('saveIntegrations');
     cy.get('#trakt-clientId').clear().type('updated-id');
