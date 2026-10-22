@@ -386,9 +386,9 @@ class TraktAPI extends ExternalAPI {
   }
 
   /**
-   * Verify the application client ID is present. Trakt no longer issues a
-   * client secret for user sign-in (PKCE replaced it), so there is nothing
-   * else to validate without starting a user flow.
+   * Verify the application client ID is present. Trakt recommends PKCE for
+   * user sign-in and deprecates client secrets for that flow, so there is
+   * nothing else to validate without starting a user flow.
    */
   public async validateApplicationCredentials(): Promise<void> {
     if (!this.clientId) {

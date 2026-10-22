@@ -386,6 +386,27 @@ describe('personal discovery account boundaries', () => {
       assert.equal('apiKey' in provider, false);
     }
   });
+  it('removes a legacy Trakt client secret when integration settings are saved', async () => {
+    const agent = await login();
+    const trakt = getSettings().discoveryIntegrations.trakt as {
+      clientId: string;
+      clientSecret?: string;
+    };
+    trakt.clientSecret = 'obsolete-trakt-secret';
+
+    try {
+      const result = await agent
+        .put('/integrations/discovery/configuration')
+        .send({ trakt: { clientId: 'replacement-trakt-app' } });
+
+      assert.equal(result.status, 200, JSON.stringify(result.body));
+      assert.deepEqual(getSettings().discoveryIntegrations.trakt, {
+        clientId: 'replacement-trakt-app',
+      });
+    } finally {
+      delete trakt.clientSecret;
+    }
+  });
   it('rejects personal mutations originating at another site', async () => {
     const agent = await login();
     const result = await agent

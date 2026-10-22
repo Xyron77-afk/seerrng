@@ -567,7 +567,12 @@ router.put(
       }
       await runWithConfigurationAdmission('discoveryIntegrations', () =>
         getSettings().persistSection('discoveryIntegrations', (current) => ({
-          trakt: { ...current.trakt, ...body.trakt },
+          // Project the Trakt settings onto the supported fields so legacy
+          // clientSecret values are removed when existing installations save
+          // their integration settings.
+          trakt: {
+            clientId: body.trakt?.clientId ?? current.trakt.clientId,
+          },
           anilist: { ...current.anilist, ...body.anilist },
           simkl: { ...current.simkl, ...body.simkl },
           mdblist: { ...current.mdblist, ...body.mdblist },
