@@ -82,9 +82,12 @@ const getCoverPath = (scene: WhisparrSceneLookup, serverId: number) => {
     scene.posterUrl ||
     scene.images.some((image) => Boolean(image.url || image.remoteUrl))
   );
-  return hasImage
-    ? `/api/v1/adult/${scene.foreignId}/cover?serverId=${serverId}`
-    : undefined;
+  if (!hasImage) return undefined;
+  // The default Whisparr server has id 0, which the cover endpoint's
+  // parseRequestedServiceId rejects (it requires id > 0). Omit the param for
+  // non-positive ids so the endpoint falls back to the default server.
+  const query = serverId > 0 ? `?serverId=${serverId}` : '';
+  return `/api/v1/adult/${scene.foreignId}/cover${query}`;
 };
 
 const toResult = (

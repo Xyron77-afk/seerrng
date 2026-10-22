@@ -4522,9 +4522,10 @@ discoverRoutes.get('/comics', async (req, res) => {
     maxIssues.value !== undefined;
 
   try {
-    // User-selected filters choose the indexed catalog query; this does not
-    // gate authorization or change which catalog data the route can expose.
-    if (hasMetadataFilters) {
+    // User-selected filters (or a bare browse with no query) use the indexed
+    // catalog; this does not gate authorization or change which catalog data
+    // the route can expose.
+    if (hasMetadataFilters || !query) {
       const scan = await getComicCatalogIndexStatus();
       if (scan.completeGeneration === 0) {
         return res.status(200).json({
@@ -4540,7 +4541,7 @@ discoverRoutes.get('/comics', async (req, res) => {
         });
       }
       const indexed = await searchComicCatalogIndex(scan.completeGeneration, {
-        query,
+        query: query || '*',
         publisher,
         startYear: startYear.value,
         minIssues: minIssues.value,
@@ -4562,15 +4563,6 @@ discoverRoutes.get('/comics', async (req, res) => {
         comicVineConfigured: true,
         indexing: false,
         lastIndexedAt: scan.lastCompletedAt,
-      });
-    }
-    if (!query) {
-      return res.status(200).json({
-        page,
-        totalPages: 0,
-        totalResults: 0,
-        results: [],
-        comicVineConfigured: true,
       });
     }
     const comicVine = new ComicVineAPI(comicVineApiKey);
